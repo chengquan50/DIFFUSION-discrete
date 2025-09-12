@@ -4,7 +4,9 @@ import torch.nn.functional as F
 import numpy as np
 from memory import *
 from models.critic import *
+from models.mlp_policy import *
 from models.diffusion_policy import *
+# =============== 9) 混合采样逻辑 ===============
 def get_mixed_actions_logits(critic_target: Critic,
                              batch_size: int,
                              diffusion_memory: DiffusionMemory,
@@ -45,16 +47,16 @@ def get_mixed_actions_logits(critic_target: Critic,
         best_logits_mix = best_logits_q_final
     return states_mix, best_logits_mix
 
-
-class DPO:
+# =============== 10) DIPO 主类 (整合 PPO 风格更新) ===============
+class DIPO:
     def __init__(self,
                  state_dim,
                  action_dim,
                  device='cpu',
                  gamma=0.99,
-                 tau=0.01,  
-                 actor_lr=1e-4, 
-                 critic_lr=3e-5,
+                 tau=0.01,  # 修改：将 tau 从 0.005 增加到 0.01，使目标网络更新更平滑
+                 actor_lr=1e-4,  # 修改：将 actor 的学习率从 5e-5 提高到 1e-4
+                 critic_lr=5e-5,
                  n_timesteps=50,
                  temperature=1.0,
                  noise_ratio=0.05,
@@ -64,11 +66,12 @@ class DPO:
                  use_ddim=True,
                  ddim_steps=10,
                  ddim_eta=0.0,
+                 distill_interval=500,
                  K_epochs=5,
                  eps_clip=0.2,
                  initial_temperature=1.0,
                  final_temperature=0.5,
-                 temperature_decay_steps=20000  
+                 temperature_decay_steps=20000  # 修改：延长温度衰减周期从 10000 到 20000
                 ):
         self.device = device
         self.gamma = gamma
@@ -95,6 +98,13 @@ class DPO:
             ).to(device)
         elif policy_type == 'mlp':
             self.actor = MLPPolicy(
+                state_dim=state_dim,
+                action_dim=action_dim,
+                temperature=temperature,
+                device=device
+            ).to(device)
+        elif policy_type == 'mlp1':
+            self.actor = MLPPolicyWithAux(
                 state_dim=state_dim,
                 action_dim=action_dim,
                 temperature=temperature,
@@ -133,6 +143,7 @@ class DPO:
             return
         self.total_it += 1
 
+        # 温度调度：线性衰减
         new_temp = self.initial_temperature + (self.final_temperature - self.initial_temperature) * (self.total_it / self.temperature_decay_steps)
         new_temp = max(new_temp, self.final_temperature)
         self.actor.temperature = new_temp
@@ -215,14 +226,22 @@ class DPO:
                     surr1 = ratio * advantage
                     surr2 = torch.clamp(ratio, 1.0 - self.eps_clip, 1.0 + self.eps_clip) * advantage
                     actor_loss = -torch.min(surr1, surr2).mean()
+
+                    # 非法动作惩罚
+                    forbidden_mask = ~mini_masks
+                    forbidden_logits = raw_logits[forbidden_mask]
+                    penalty_forbidden = F.relu(forbidden_logits).pow(2).mean() if forbidden_logits.numel() > 0 else 0.0
+                    lambda_penalty = 0.0
+
+                   
                     entropy_term = -(final_probs * log_probs).sum(dim=1).mean()
                     lambda_entropy = 0.01
-                    actor_loss_total = actor_loss  + lambda_entropy * entropy_term
 
+                    actor_loss_total = actor_loss  + lambda_penalty * penalty_forbidden + lambda_entropy * entropy_term
 
-                    
+                    # 辅助 imitation learning 蒸馏
                     aux_loss = 0.0
-                    if len(diffusion_memory) > 0:
+                    if self.policy_type == 'diffusion' and len(diffusion_memory) > 0:
                         states_best, best_actions_logits = get_mixed_actions_logits(
                             critic_target=self.critic_target,
                             batch_size=batch_size,
@@ -236,6 +255,7 @@ class DPO:
 
                     lambda_aux = 0.05
                     actor_loss_total += lambda_aux * aux_loss
+
                     self.actor_optimizer.zero_grad()
                     actor_loss_total.backward()
                     torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)

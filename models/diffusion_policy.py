@@ -4,6 +4,19 @@ import torch.nn.functional as F
 import numpy as np
 from models.feature_extractor import GraphColoringFeatureExtractor
 
+def extract(arr, t, x_shape):
+    batch_size = t.shape[0]
+    out = arr[t].reshape(batch_size, *((1,) * (len(x_shape) - 1)))
+    return out
+
+def cosine_beta_schedule(timesteps, s=0.008, dtype=torch.float32):
+    steps = timesteps + 1
+    x = np.linspace(0, steps, steps)
+    alphas_cumprod = np.cos(((x/steps)+s)/(1+s)*np.pi*0.5)**2
+    alphas_cumprod = alphas_cumprod/alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:]/alphas_cumprod[:-1])
+    betas_clipped = np.clip(betas, a_min=0, a_max=0.999)
+    return torch.tensor(betas_clipped, dtype=dtype)
 
 
 # =============== 6) DiffusionPolicy ===============
@@ -20,7 +33,7 @@ class DiffusionPolicy(nn.Module):
                  loss_type='cross_entropy',
                  use_ddim=False,
                  ddim_steps=10,
-                 ddim_eta=0.1,
+                 ddim_eta=0.0,
                  hidden_size=128,
                  attn_output_size=64):
         super(DiffusionPolicy, self).__init__()
@@ -145,6 +158,32 @@ class DiffusionPolicy(nn.Module):
         shape = (batch_size, self.action_dim)
         x = self.p_sample_loop(projected_state, shape, add_noise=True)
         return x
+
+    def encode_states_batch(self, states_list: list):
+        adj_matrices = []
+        for state in states_list:
+            adj = state["adj_matrix"]
+            if not torch.is_tensor(adj):
+                adj = torch.tensor(adj, device=self.device, dtype=torch.float32)
+            else:
+                adj = adj.to(self.device)
+            adj_matrices.append(adj)
+        batched_adj = torch.stack(adj_matrices, dim=0)
+        batched_state = {"adj_matrix": batched_adj}
+        features = self.feature_extractor(batched_state)
+        projected_state = self.state_proj(features)
+        return projected_state
+
+    def encode_state(self, state_dict):
+        adj = state_dict['adj_matrix']
+        if not torch.is_tensor(adj):
+            adj = torch.tensor(adj, device=self.device, dtype=torch.float32)
+        else:
+            adj = adj.to(self.device)
+        state_input = {"adj_matrix": adj.unsqueeze(0)}
+        features = self.feature_extractor(state_input)
+        projected_state = self.state_proj(features)
+        return projected_state
 
     def forward(self, state_dict, mask=None, eval=False):
         projected_state = self.encode_state(state_dict)

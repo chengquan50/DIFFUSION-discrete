@@ -46,8 +46,8 @@ def main():
         temperature_decay_steps=config.TEMPERATURE_DECAY_STEPS
     )
 
-    memory = ReplayMemory(capacity=config.MEMORY_CAPACITY)
-    diffusion_memory = DiffusionMemory(capacity=config.MEMORY_CAPACITY)
+    memory = ReplayMemory(capacity=int(config.MEMORY_CAPACITY*2))
+    diffusion_memory = DiffusionMemory(capacity=int(config.MEMORY_CAPACITY/5))
     highreward_memory = HighRewardTrajectoryMemory(capacity=config.EXPERT_MEMORY_CAPACITY, action_dim=env.action_space.n)
 
     for ep in range(config.NUM_EPISODES):
